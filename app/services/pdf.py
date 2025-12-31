@@ -1,17 +1,13 @@
-from myvector_store.myvector_store import (
-    upsert_chunks,
-    ensure_collection
-)
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict
-from app.mychunker.mychunker import chunk_text_with_page_tracking
-from app.myembeding.myembeding import get_embedding_model
-from app.myvector_store.myvector_store import BM25SparseEncoder
-from qdrant_client import QdrantClient 
+from typing import Tuple, Optional, List, Dict, Any
 from pypdf import PdfReader
+from qdrant_client import QdrantClient
 
+from app.services.chunker import chunk_text_with_page_tracking
+from app.services.embedding import get_embedding_model
+from app.services.search import BM25SparseEncoder, upsert_chunks, ensure_collection
 
 def pdf_to_searchable_pdf(source_path: str) -> Tuple[bool, str]:
     """
@@ -40,19 +36,7 @@ def pdf_to_searchable_pdf(source_path: str) -> Tuple[bool, str]:
         stt = False
     return stt, dest_path_pdf
 
-
-def extract_text(pdf_path: str) -> str:
-    """Extract text from a (searchable) PDF using pypdf."""
-    text_chunks = []
-    with open(pdf_path, 'rb') as f:
-        reader = PdfReader(f)
-        for page in reader.pages:
-            page_text = page.extract_text() or ""
-            text_chunks.append(page_text)
-    return "\n".join(text_chunks)
-
-
-def extract_text_with_pages(pdf_path: str) -> List[Dict[str, any]]:
+def extract_text_with_pages(pdf_path: str) -> List[Dict[str, Any]]:
     """Extract text from a PDF with page number tracking.
     
     Returns:
@@ -69,17 +53,14 @@ def extract_text_with_pages(pdf_path: str) -> List[Dict[str, any]]:
             })
     return pages_data
 
-
 def process_single_pdf(
+    client: QdrantClient,
     file_path: str,
     collection_name: str,
-    model_name: Optional[str],
-    chunk_size: int,
-    chunk_overlap: int,
-    qdrant_host: str,
-    qdrant_port: int,
-    qdrant_api_key: Optional[str],
-) -> dict:
+    model_name: Optional[str] = None,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
+) -> Dict[str, Any]:
     """Process a single PDF file and return processing details."""
     try:
         # OCR and extraction
@@ -99,6 +80,14 @@ def process_single_pdf(
             pages_data, chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )
         
+        if not chunks_with_pages:
+             return {
+                "filename": Path(file_path).name,
+                "chunks": 0,
+                "status": "error",
+                "message": "No chunks generated"
+            }
+
         # Embeddings
         embedder = get_embedding_model(model_name)
         chunk_texts = [chunk["text"] for chunk in chunks_with_pages]
@@ -109,11 +98,7 @@ def process_single_pdf(
         sparse_encoder = BM25SparseEncoder()
         sparse_vectors = sparse_encoder.encode_documents(chunk_texts)
         
-        # Upsert to Qdrant
-        if qdrant_api_key and qdrant_api_key.strip():
-            client = QdrantClient(host=qdrant_host, port=qdrant_port, api_key=qdrant_api_key)
-        else:
-            client = QdrantClient(host=qdrant_host, port=qdrant_port)
+        # Ensure collection exists
         ensure_collection(client, collection_name, vector_size)
         
         pdf_filename = Path(file_path).name

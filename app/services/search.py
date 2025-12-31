@@ -1,10 +1,10 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct, SparseVector, SparseVectorParams, SparseIndexParams
 import uuid
 from collections import Counter
 import math
-
+from app.services.embedding import get_embedding_model
 
 class BM25SparseEncoder:
     """Simple BM25-based sparse encoder for hybrid search."""
@@ -52,16 +52,9 @@ class BM25SparseEncoder:
         
         return sparse_vectors
 
-
 def ensure_collection(client: QdrantClient, collection_name: str, vector_size: int, distance: Distance = Distance.COSINE):
     """Create collection with hybrid search support (dense + sparse vectors)."""
-    exists = False
-    try:
-        info = client.get_collection(collection_name)
-        exists = True
-    except Exception:
-        exists = False
-    if not exists:
+    if not client.collection_exists(collection_name):
         client.create_collection(
             collection_name=collection_name,
             vectors_config={
@@ -73,7 +66,6 @@ def ensure_collection(client: QdrantClient, collection_name: str, vector_size: i
                 ),
             },
         )
-
 
 def upsert_chunks(
     client: QdrantClient,
@@ -92,3 +84,46 @@ def upsert_chunks(
         for dense_vec, sparse_vec, payload in zip(embeddings, sparse_vectors, payloads)
     ]
     client.upsert(collection_name=collection_name, points=points)
+
+def perform_hybrid_search(
+    client: QdrantClient,
+    collection_name: str,
+    query_text: str,
+    model_name: Optional[str],
+    limit: int
+) -> List[dict]:
+    """Perform hybrid search and return results with URLs."""
+    embedder = get_embedding_model(model_name)
+    dense_vector = embedder.embed([query_text])[0]
+    
+    # Note: This sparse encoder is stateless and calculates IDF based on the query itself.
+    # Ideally, it should use a pre-computed vocabulary/IDF from the corpus.
+    sparse_encoder = BM25SparseEncoder()
+    sparse_vector = sparse_encoder.encode_documents([query_text])[0]
+    
+    results = client.query_points(
+        collection_name=collection_name,
+        query=dense_vector,
+        using="dense",
+        limit=limit,
+    )
+    
+    sources = []
+    for point in results.points:
+        payload = point.payload
+        source_path = payload.get("source_path", "")
+        filename = payload.get("filename", "")
+        page_number = payload.get("page_number", "N/A")
+        
+        # Assume source_path is a local file; convert to download URL if needed
+        url = f"file://{source_path}" if source_path else "N/A"
+        
+        sources.append({
+            "url": url,
+            "filename": filename,
+            "page_number": page_number,
+            "source_path": source_path,
+            "text": payload.get("text", "")[:300],  # Truncate for brevity
+            "score": float(point.score)
+        })
+    return sources

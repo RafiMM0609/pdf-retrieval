@@ -1,41 +1,31 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from typing import List, Optional
 import os
-import tempfile
 import shutil
-from pathlib import Path
-from qdrant_client import QdrantClient
-from app.mypdf_handler.mypdf_handler import process_single_pdf
-from app.schemas.schemas import (
-    QueryRequest,
-    QueryResponse,
-    UploadResponse
-)
-from app.myopenrouter.myopenrouter import generate_answer_with_openrouter
-from app.myqdrant_client.myqdrant import perform_hybrid_search
+import tempfile
+import asyncio
+from typing import List, Optional
 
-app = FastAPI(title="PDF RAG API", description="Retrieve and generate answers from PDF chunks using hybrid search and OpenRouter")
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi.concurrency import run_in_threadpool
+from qdrant_client import QdrantClient
+
+from app.config import get_settings, Settings
+from app.dependencies import get_qdrant_client
+from app.schemas.api import QueryRequest, QueryResponse, UploadResponse
+from app.services.llm import generate_answer_with_openrouter
+from app.services.pdf import process_single_pdf
+from app.services.search import perform_hybrid_search
+
+app = FastAPI(
+    title="PDF RAG API", 
+    description="Retrieve and generate answers from PDF chunks using hybrid search and OpenRouter"
+)
 
 @app.post("/query", response_model=QueryResponse)
-async def query_documents(request: QueryRequest):
-    """Endpoint to query documents and get AI-generated answer.
-    
-    Parameters:
-    - query: The search query string
-    - collection_name: Name of the Qdrant collection to search
-    - limit: Maximum number of search results to retrieve (default: 5)
-    - model_name: Embedding model name (optional)
-    - max_tokens: Maximum number of tokens in AI response (default: 500, max: 3000)
-    """
-    qdrant_host = os.getenv("QDRANT_HOST", "localhost")
-    qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
-    qdrant_api_key = os.getenv("QDRANT_API_KEY")
-    
-    # Initialize QdrantClient - only pass api_key if it's not empty
-    if qdrant_api_key and qdrant_api_key.strip():
-        client = QdrantClient(host=qdrant_host, port=qdrant_port, api_key=qdrant_api_key)
-    else:
-        client = QdrantClient(host=qdrant_host, port=qdrant_port)
+def query_documents(
+    request: QueryRequest,
+    client: QdrantClient = Depends(get_qdrant_client)
+):
+    """Endpoint to query documents and get AI-generated answer."""
     
     # Perform hybrid search
     sources = perform_hybrid_search(
@@ -43,17 +33,21 @@ async def query_documents(request: QueryRequest):
         collection_name=request.collection_name,
         query_text=request.query,
         model_name=request.model_name,
-        limit=request.limit
+        limit=request.limit or 5
     )
     
     if not sources:
         return QueryResponse(answer="No relevant information found.", sources=[], unique_files=[])
     
     # Generate answer with OpenRouter
-    answer = generate_answer_with_openrouter(request.query, sources, request.max_tokens)
+    answer = generate_answer_with_openrouter(
+        query=request.query, 
+        sources=sources, 
+        max_tokens=request.max_tokens or 500
+    )
     
     # Extract unique filenames
-    unique_files = list(set(source["filename"] for source in sources if source["filename"]))
+    unique_files = list(set(source["filename"] for source in sources if source.get("filename")))
     
     return QueryResponse(answer=answer, sources=sources, unique_files=unique_files)
 
@@ -64,30 +58,13 @@ async def upload_knowledge(
     model_name: Optional[str] = None,
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
+    client: QdrantClient = Depends(get_qdrant_client)
 ):
     """
     Upload multiple PDF files and process them into Qdrant collection.
-    
-    Parameters:
-    - files: List of PDF files to upload
-    - collection_name: Name of the Qdrant collection to store embeddings
-    - model_name: Embedding model name (default: BAAI/bge-m3)
-    - chunk_size: Size of text chunks (default: 1000)
-    - chunk_overlap: Overlap between chunks (default: 200)
     """
-    qdrant_host = os.getenv("QDRANT_HOST", "localhost")
-    qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
-    qdrant_api_key = os.getenv("QDRANT_API_KEY")
-    
     # Validate files are PDFs
-    pdf_files = []
-    for file in files:
-        if not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {file.filename} is not a PDF. Only PDF files are accepted."
-            )
-        pdf_files.append(file)
+    pdf_files = [f for f in files if f.filename and f.filename.lower().endswith('.pdf')]
     
     if not pdf_files:
         raise HTTPException(status_code=400, detail="No PDF files provided")
@@ -96,26 +73,33 @@ async def upload_knowledge(
     temp_dir = tempfile.mkdtemp()
     
     try:
-        # Save uploaded files temporarily and process them
+        # Save uploaded files temporarily
+        saved_paths = []
         for file in pdf_files:
+            if not file.filename:
+                continue
+                
             temp_path = os.path.join(temp_dir, file.filename)
             
             # Save uploaded file
             with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
+            saved_paths.append(temp_path)
             
-            # Process the PDF
-            result = process_single_pdf(
-                file_path=temp_path,
+        # Process the PDFs in parallel
+        async def process_file(path):
+            return await run_in_threadpool(
+                process_single_pdf,
+                client=client,
+                file_path=path,
                 collection_name=collection_name,
                 model_name=model_name,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
-                qdrant_host=qdrant_host,
-                qdrant_port=qdrant_port,
-                qdrant_api_key=qdrant_api_key,
             )
-            files_details.append(result)
+
+        if saved_paths:
+            files_details = await asyncio.gather(*[process_file(path) for path in saved_paths])
     
     finally:
         # Cleanup temporary files
@@ -139,6 +123,6 @@ async def root():
         "message": "PDF RAG API is running.",
         "endpoints": {
             "POST /upload": "Upload multiple PDF files to knowledge base",
-            "POST /query": "Query documents and get AI-generated answers (supports limit and max_tokens parameters)"
+            "POST /query": "Query documents and get AI-generated answers"
         }
     }

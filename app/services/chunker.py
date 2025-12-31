@@ -1,6 +1,5 @@
-from typing import List, Dict
+from typing import List, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 
 def chunk_text(
     text: str,
@@ -23,13 +22,12 @@ def chunk_text(
     )
     return splitter.split_text(text)
 
-
 def chunk_text_with_page_tracking(
-    pages_data: List[Dict[str, any]],
+    pages_data: List[Dict[str, Any]],
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
     separators: List[str] | None = None,
-) -> List[Dict[str, any]]:
+) -> List[Dict[str, Any]]:
     """Chunk text while preserving page number information.
     
     Args:
